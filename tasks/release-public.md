@@ -21,14 +21,17 @@ permission dialog.
   signed-bytes cache copy-back, absolute invocation (no relative shebang for control).
 
 ## Blocking before any public release (verify, don't assume)
-1. **Verify Automation/EventKit inheritance on real macOS.** We only proved Full Disk
-   Access. Trigger a Reminders/Calendar/Mail (EventKit + AppleEvents) access through a
-   launchd-launched `python-tcc-<project>` and confirm the grant attaches to it (not to
-   the python child / osascript). Codex flagged these may key on the sending process.
-2. **Verify the TCC dialog/Settings display name** actually shows `python-tcc-<project>`
-   (not `python-tcc`, `python`, or the resolved path) for a bare ad-hoc CLI binary
-   invoked via the symlink. If it disappoints, fall back to a minimal signed `.app`
-   with `CFBundleName`/`CFBundleIdentifier`.
+1. **[VERIFIED 2026-06-05 on mac-mcp]** Automation/EventKit inheritance works on real
+   macOS. Under launchd (ppid 1, no terminal ancestor), `python-tcc-mac-mcp` reads
+   GoogleDrive (kTCCServiceFileProviderDomain) AND Reminders (kTCCServiceReminders).
+   TCC.db records BOTH grants against the binary path
+   `.../.venv/bin/python-tcc-mac-mcp` = ALLOW — so EventKit attributes to the
+   responsible signed parent, not the python child. (Calendar/Mail same class; will
+   prompt on first use.) Tested macOS: Darwin 25.5.0.
+2. **[VERIFIED 2026-06-05]** Display identity = the per-project binary. TCC.db stores
+   the client as `python-tcc-<project>`'s full path, so the prompt/Settings show that
+   name — no `.app` bundle needed. (Re-confirm the human-readable dialog string on a
+   couple more macOS versions before claiming it broadly.)
 3. **Document the foundations honestly.** It relies on *undocumented* TCC
    responsible-process inheritance and ad-hoc cdhash determinism that can drift across
    macOS/codesign versions. README needs a clear "unofficial, may break on a future
