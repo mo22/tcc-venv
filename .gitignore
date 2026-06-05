@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# venv
+.venv/
+venv/
+
+# Claude / agent local state
+.claude/settings.local.json
+.claude/.claude_state.json
+.claude/*.lock
+
+# macOS
+.DS_Store
