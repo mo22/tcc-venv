@@ -46,6 +46,12 @@ relies on *undocumented* TCC responsible-process inheritance and ad-hoc cdhash
 determinism, both of which can change across macOS releases — treat it as unofficial
 and verify on the macOS versions you ship to.
 
+**Tested:** on macOS Darwin 25.5.0, both Full Disk Access and EventKit/Reminders
+access through a launchd-launched (no terminal ancestor) `python-tcc-<project>`
+attach the grant to that signed binary — TCC records it against the per-project
+binary path, not the python child — confirming the responsible-process inheritance
+this tool depends on. Re-confirm on the macOS versions you target.
+
 ## Requirements
 
 - macOS with the **Xcode Command Line Tools** (`xcode-select --install`) — the
