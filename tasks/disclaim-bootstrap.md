@@ -84,9 +84,9 @@ launcher (GUI app / terminal / launchd) → A (trampoline, inherited launcher's 
 
 ## Follow-on (separate)
 
-- `tcc-venv ensure --identity <id>`: create venv + `uv sync` + build/sign trampoline +
-  print the launch command. The "git clone → one command → paste config" path.
+- [x] `tcc-venv run [--cd-to-project] [--venv DIR] CMD…` — wrap-on-demand, then exec CMD
+      under the identity via the trampoline's generic-exec mode (`$TCC_VENV_EXEC`).
+      Shipped in v0.2.0. Supports the `uvx tcc-venv run … uv run --frozen` shebang.
 - `--identity` explicit flag (path-independent identifier) alongside the derived default.
-- Optional uvx-friendly self-healing entry (sync up front, wrap, exec trampoline) —
-  identity-correct via the bootstrap, but per-launch latency; offer alongside the direct
-  absolute-binary command, don't replace it. Do NOT leave `uv run` in the runtime chain.
+- Optionally enforce that generic-exec only runs commands inside the venv (low priority:
+  whoever can exec the venv can usually edit the script in it anyway).

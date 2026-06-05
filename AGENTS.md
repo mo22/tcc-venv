@@ -20,7 +20,7 @@ that the user grants once.
 
 ```
 src/tcc_venv/
-  cli.py          # the `tcc-venv` CLI: wrap / status. build + codesign + cache logic.
+  cli.py          # the `tcc-venv` CLI: wrap / run / status. build + codesign + cache logic.
   trampoline.c    # the signed launcher. self-locates its venv, spawns python, forwards signals.
   __init__.py
 pyproject.toml    # hatchling; force-includes trampoline.c into the wheel.
@@ -72,6 +72,13 @@ The trampoline:
   other truthy value (e.g. `1`) → the project root (the venv's parent), so a process
   launched with an unpredictable cwd (a GUI app) runs from its repo; unset/`0` →
   untouched. A failed chdir is a hard error.
+- **generic-exec mode** (`$TCC_VENV_EXEC=1`, set only by `tcc-venv run`): instead of
+  running its own venv python, it execs an explicit command (`argv[1]`, already an
+  absolute path from the CLI) under its identity — so `tcc-venv run uv run …` puts the
+  stable identity over a `uv run` subtree (the disclaim bootstrap makes uv/python below
+  inherit it). The `$VIRTUAL_ENV` guard is skipped in this mode (the command is
+  explicit). Both guard envs are consumed so they never leak into the child. Default
+  mode (no `$TCC_VENV_EXEC`) is unchanged: venv python only, guard intact.
 - `posix_spawn`s `<venv>/bin/python` (falls back to `python3`) and stays the live
   parent (must NOT exec into python, or the child becomes the responsible process
   and loses the grant).

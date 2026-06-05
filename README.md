@@ -130,14 +130,38 @@ app through the shim:
 # or in a shebang:  #!/path/to/.venv/bin/python-tcc
 ```
 
+## Two ways to launch: `wrap` vs `run`
+
+**`wrap` + invoke the binary directly** — leanest, for long-lived servers. Point the
+launcher straight at `<venv>/bin/python-tcc-<project>`; zero per-launch overhead,
+offline-safe. (Re-run `wrap` after `uv sync`.)
+
+**`tcc-venv run` — wrap-on-demand, then run anything under the identity.** It builds and
+signs the launcher if missing, then execs your command as the TCC-responsible parent.
+The command can be `uv run …` (the launcher disclaims first, so identity still attaches
+to the stable binary), so you get uv's auto-sync without losing the grant:
+
+```bash
+tcc-venv run --cd-to-project uv run --frozen my_app.py
+# or a module:  tcc-venv run -m my_app
+# in a shebang (note env -S for the multi-token line):
+#!/usr/bin/env -S uvx tcc-venv run --cd-to-project uv run --frozen
+```
+
+`run` discovers the nearest `.venv` from the cwd; pass `--venv DIR` for split layouts or
+an unpredictable cwd. `--cd-to-project` runs from the venv's parent. The convenience
+costs `uvx`/`uv` startup per launch — use the direct-binary path when latency matters.
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
 | `tcc-venv wrap [venv ...]` | Install/refresh the launcher (idempotent). Defaults to `./.venv`. Accepts multiple venvs. |
 | `tcc-venv wrap --rebuild`  | Force a fresh build + sign (new cdhash — you'll need to re-grant FDA). |
-| `tcc-venv wrap --identifier-prefix PREFIX` | Override the codesign identifier prefix (default `local.tcc-venv`). |
+| `tcc-venv run [--cd-to-project] [--venv DIR] CMD…` | Wrap-on-demand, then run `CMD` under the stable identity (e.g. `uv run …`). |
 | `tcc-venv status [venv]`   | Show the installed shim, target, cdhash, and expected identifier. |
+
+Both commands accept `--identifier-prefix PREFIX` (default `local.tcc-venv`).
 
 The identifier is `<prefix>.<project>.<hash8>`, where `<prefix>` defaults to
 `local.tcc-venv` (override with `--identifier-prefix` or `$TCC_VENV_IDENTIFIER_PREFIX`)

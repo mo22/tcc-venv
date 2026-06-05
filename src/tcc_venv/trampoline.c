@@ -39,6 +39,10 @@
 
 extern char **environ;
 
+/* Set by `tcc-venv run`: exec an explicit command (already resolved to an absolute
+ * path by the CLI) under our stable identity, instead of our venv python. */
+#define EXEC_MODE_ENV "TCC_VENV_EXEC"
+
 #ifdef __APPLE__
 /* Private SPI — the same call LLDB uses so the *debuggee* (not the debugger) owns
  * TCC prompts. Setting it on a posix_spawnattr makes the SPAWNED CHILD disclaim our
@@ -346,6 +350,35 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "python-tcc: unexpected install location (not <venv>/bin/...)\n");
         free(venv);
         return 127;
+    }
+
+    /* Generic-exec mode (set by `tcc-venv run`): exec an explicit command under our
+     * stable, self-responsible identity instead of our venv python. argv[1] is the
+     * program (the CLI already resolved it to an absolute path). The $VIRTUAL_ENV
+     * guard below is skipped — the command is explicit, not interpreter-selection.
+     * Consume the env so it never leaks into the child. */
+    const char *exec_req = getenv(EXEC_MODE_ENV);
+    int exec_mode = exec_req != NULL && exec_req[0] != '\0' && strcmp(exec_req, "0") != 0;
+    unsetenv(EXEC_MODE_ENV);
+    if (exec_mode) {
+        if (argc < 2) {
+            fprintf(stderr, "python-tcc: %s set but no command given\n", EXEC_MODE_ENV);
+            free(venv);
+            return 127;
+        }
+        if (apply_chdir(venv) != 0) {
+            free(venv);
+            return 127;
+        }
+        free(venv);
+#ifndef __APPLE__
+        execv(argv[1], &argv[1]);
+        fprintf(stderr, "python-tcc: execv %s failed: %s\n", argv[1], strerror(errno));
+        return 127;
+#else
+        int rc = spawn_and_supervise(argv[1], &argv[1], NULL, /*manage_terminal=*/1);
+        return rc == SUPERVISE_SPAWN_FAILED ? 127 : rc;
+#endif
     }
 
     /* Security: never let a stray $VIRTUAL_ENV redirect us to another venv. */

@@ -32,6 +32,10 @@ SOURCE = Path(__file__).with_name("trampoline.c")
 DEFAULT_IDENTIFIER_PREFIX = "local.tcc-venv"
 CFLAGS = ["-Wall", "-Wextra", "-O2"]
 
+# Trampoline env contract (kept in sync with trampoline.c).
+EXEC_MODE_ENV = "TCC_VENV_EXEC"  # run an explicit command under our identity
+CHDIR_ENV = "TCC_VENV_CHDIR"  # cwd for the child (1 = project root, or a path)
+
 
 # --------------------------------------------------------------------------- #
 # helpers
@@ -221,6 +225,40 @@ def _symlink(link: Path, target: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _ensure_installed(
+    venv: Path, prefix: str, *, source_tag: str, arch: str, rebuild: bool = False
+) -> tuple[Path, bool]:
+    """Build/sign/cache the trampoline for `venv` and install it (idempotent, macOS).
+    Returns (installed_path, fresh) where fresh is True if we had to build+sign anew
+    (a new cdhash → FDA re-grant) rather than restoring identical cached bytes.
+
+    The signed cache is keyed by identifier + arch + source tag: re-wrap after
+    `uv sync` restores byte-identical bytes (grant persists), but upgrading tcc-venv to
+    a changed trampoline busts the cache → fresh build+sign → new cdhash (a one-time
+    re-grant, which a genuinely different binary requires anyway). Arch is in the key
+    because signed bytes are arch-specific. The restore is verified, not trusted, so a
+    corrupt/mismatched cache falls through to a fresh build (Codex #5)."""
+    bindir = venv / "bin"
+    filename, identifier = _identity(venv, prefix)
+    installed = bindir / filename
+    signed_cache = CACHE_DIR / "signed" / f"{identifier}.{arch}.{source_tag}"
+
+    restored = False
+    if signed_cache.exists() and not rebuild:
+        restored = _atomic_install(installed, signed_cache, identifier, sign=False)
+    if not restored:
+        unsigned = _build_unsigned()
+        if not _atomic_install(installed, unsigned, identifier, sign=True):
+            _die(f"codesign verification failed for {installed}")
+        signed_cache.parent.mkdir(parents=True, exist_ok=True)
+        cache_tmp = signed_cache.with_suffix(".tmp")
+        shutil.copyfile(installed, cache_tmp)
+        os.replace(cache_tmp, signed_cache)
+
+    _symlink(bindir / "python-tcc", filename)
+    return installed, not restored
+
+
 def cmd_wrap(args: argparse.Namespace) -> None:
     prefix = _identifier_prefix(args)
     # Compute once so every venv in a single invocation is keyed consistently, even
@@ -229,46 +267,21 @@ def cmd_wrap(args: argparse.Namespace) -> None:
     arch = _arch()
     for raw in args.venv or [None]:
         venv = _venv_dir(raw)
-        bindir = venv / "bin"
-        shim = bindir / "python-tcc"
+        shim = venv / "bin" / "python-tcc"
 
         if not IS_MACOS:
             _symlink(shim, "python")
             print(f"{shim} -> python   (non-macOS passthrough)")
             continue
 
-        filename, identifier = _identity(venv, prefix)
-        installed = bindir / filename
-        # Key the signed cache by identifier + arch + source tag: re-wrap after
-        # `uv sync` restores byte-identical bytes (grant persists), but upgrading
-        # tcc-venv to a changed trampoline busts the cache → fresh build+sign → new
-        # cdhash (a one-time FDA re-grant, which a genuinely different binary requires
-        # anyway). Arch is in the key because signed bytes are arch-specific.
-        signed_cache = CACHE_DIR / "signed" / f"{identifier}.{arch}.{source_tag}"
-
-        # Reuse the exact signed bytes if we have them (Codex #7: copy-back beats
-        # re-signing, so the cdhash — and thus the TCC grant — is identical by
-        # construction across uv sync / codesign version drift). The restore is
-        # verified, not trusted, so a corrupt/mismatched cache falls through to a
-        # fresh build (Codex #5).
-        restored = False
-        if signed_cache.exists() and not args.rebuild:
-            restored = _atomic_install(installed, signed_cache, identifier, sign=False)
-
-        if not restored:
-            unsigned = _build_unsigned()
-            if not _atomic_install(installed, unsigned, identifier, sign=True):
-                _die(f"codesign verification failed for {installed}")
-            signed_cache.parent.mkdir(parents=True, exist_ok=True)
-            cache_tmp = signed_cache.with_suffix(".tmp")
-            shutil.copyfile(installed, cache_tmp)
-            os.replace(cache_tmp, signed_cache)
-
-        _symlink(shim, filename)
+        installed, _ = _ensure_installed(
+            venv, prefix, source_tag=source_tag, arch=arch, rebuild=args.rebuild
+        )
+        _, identifier = _identity(venv, prefix)
 
         print(f"wrapped {venv}")
         print(f"  binary:     {installed}")
-        print(f"  shim:       {shim} -> {filename}")
+        print(f"  shim:       {shim} -> {installed.name}")
         print(f"  identifier: {identifier}")
         print(f"  cdhash:     {_cdhash(installed)}")
         print("  run your app through this stable binary (not uv/uvx), e.g.:")
@@ -305,6 +318,64 @@ def cmd_status(args: argparse.Namespace) -> None:
         print(f"  expect: {identifier}")
 
 
+def _run_venv(arg: str | None) -> Path:
+    """Resolve the venv for `run`: an explicit --venv, else the nearest `.venv`
+    (with a pyvenv.cfg) walking up from the cwd. Pass --venv for split layouts or
+    when launched with an unpredictable cwd (e.g. from a shebang)."""
+    if arg:
+        return _venv_dir(arg)
+    cur = Path.cwd().resolve()
+    for d in (cur, *cur.parents):
+        if (d / ".venv" / "pyvenv.cfg").exists():
+            return d / ".venv"
+    _die("run: no .venv found from cwd upward — pass --venv DIR")
+
+
+def cmd_run(args: argparse.Namespace) -> NoReturn:
+    """Wrap-on-demand, then exec a command under the stable signed identity.
+    `tcc-venv run [--cd-to-project] [--venv DIR] CMD...` — CMD runs with this venv's
+    python-tcc as the TCC-responsible parent (works under any launcher via the
+    trampoline's disclaim bootstrap). The command may be `uv run …`, a script, etc."""
+    cmd = list(args.cmd)
+    if cmd and cmd[0] == "--":  # tolerate an explicit separator
+        cmd = cmd[1:]
+    if not cmd:
+        _die("run: no command given (usage: tcc-venv run [opts] CMD ...)")
+
+    # Resolve the program to an absolute path — the trampoline execs by path (no PATH
+    # search) and may chdir before exec, so a relative program would break.
+    prog = str(Path(cmd[0]).resolve()) if "/" in cmd[0] else shutil.which(cmd[0])
+    if not prog or not Path(prog).exists():
+        _die(f"run: command not found: {cmd[0]}")
+
+    if not IS_MACOS:  # no TCC: just exec the command directly, no trampoline
+        try:
+            os.execv(prog, [prog, *cmd[1:]])
+        except OSError as e:
+            _die(f"run: exec failed for {prog}: {e}")
+
+    venv = _run_venv(args.venv)
+    installed, fresh = _ensure_installed(
+        venv, _identifier_prefix(args), source_tag=_source_tag(), arch=_arch()
+    )
+    if fresh:
+        print(f"tcc-venv: installed {installed}", file=sys.stderr)
+        print(
+            "tcc-venv: grant it Full Disk Access once — System Settings -> "
+            "Privacy & Security -> Full Disk Access",
+            file=sys.stderr,
+        )
+
+    env = dict(os.environ)
+    env[EXEC_MODE_ENV] = "1"
+    if args.cd_to_project:
+        env[CHDIR_ENV] = "1"
+    try:
+        os.execve(str(installed), [str(installed), prog, *cmd[1:]], env)
+    except OSError as e:
+        _die(f"run: exec failed for {installed}: {e}")
+
+
 def _add_prefix_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--identifier-prefix",
@@ -335,6 +406,26 @@ def main() -> None:
     p_status.add_argument("venv", nargs="?", help="venv dir; default ./.venv")
     _add_prefix_arg(p_status)
     p_status.set_defaults(func=cmd_status)
+
+    p_run = sub.add_parser(
+        "run",
+        help="wrap-on-demand, then run a command under the stable TCC identity",
+    )
+    p_run.add_argument(
+        "--venv", help="venv dir (default: nearest .venv from cwd upward)"
+    )
+    p_run.add_argument(
+        "--cd-to-project",
+        action="store_true",
+        help="run the command from the project root (the venv's parent)",
+    )
+    _add_prefix_arg(p_run)
+    p_run.add_argument(
+        "cmd",
+        nargs=argparse.REMAINDER,
+        help="the command to run, e.g. `uv run --frozen server.py` or `-m mymod`",
+    )
+    p_run.set_defaults(func=cmd_run)
 
     args = parser.parse_args()
     args.func(args)
