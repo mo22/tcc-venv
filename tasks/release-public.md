@@ -51,11 +51,11 @@ permission dialog.
       `cc`). Document the Xcode CLT requirement.
 
 ### c) Parameterize the branding
-- [ ] Make the identifier prefix configurable (flag / env / config) instead of the
-      hardcoded `ai.mxs.tcc.`. Default to something generic (e.g. derived from a
-      `--identifier-prefix`, fallback `local.tcc-venv`).
+- [x] Make the identifier prefix configurable (flag / env / config) instead of the
+      hardcoded `ai.mxs.tcc.`. Done 2026-06-05: `--identifier-prefix` flag +
+      `$TCC_VENV_IDENTIFIER_PREFIX`, default `local.tcc-venv`.
 - [ ] Make the shim/binary name prefix (`python-tcc`) overridable if needed.
-- [ ] Strip any other mxs-specific assumptions.
+- [x] Strip any other mxs-specific assumptions (identifier prefix was the only one).
 
 ### d) Docs & framing
 - [ ] README: the problem (uv/python upgrade kills TCC grants), the mechanism, install,

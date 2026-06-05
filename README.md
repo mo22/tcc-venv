@@ -124,10 +124,13 @@ app through the shim:
 | --- | --- |
 | `tcc-venv wrap [venv ...]` | Install/refresh the launcher (idempotent). Defaults to `./.venv`. Accepts multiple venvs. |
 | `tcc-venv wrap --rebuild`  | Force a fresh build + sign (new cdhash — you'll need to re-grant FDA). |
+| `tcc-venv wrap --identifier-prefix PREFIX` | Override the codesign identifier prefix (default `local.tcc-venv`). |
 | `tcc-venv status [venv]`   | Show the installed shim, target, cdhash, and expected identifier. |
 
-The identifier is `ai.mxs.tcc.<project>.<hash8>`, where `<hash8>` is derived from the
-venv's real path so two projects with the same name never share a grant.
+The identifier is `<prefix>.<project>.<hash8>`, where `<prefix>` defaults to
+`local.tcc-venv` (override with `--identifier-prefix` or `$TCC_VENV_IDENTIFIER_PREFIX`)
+and `<hash8>` is derived from the venv's real path so two projects with the same name
+never share a grant.
 
 ## How it works (short version)
 

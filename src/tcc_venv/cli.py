@@ -24,10 +24,13 @@ from pathlib import Path
 from typing import NoReturn
 
 IS_MACOS = sys.platform == "darwin"
-CACHE_DIR = Path(
-    os.environ.get("TCC_VENV_CACHE", Path.home() / ".cache" / "tcc-venv")
-)
+CACHE_DIR = Path(os.environ.get("TCC_VENV_CACHE", Path.home() / ".cache" / "tcc-venv"))
 SOURCE = Path(__file__).with_name("trampoline.c")
+
+# Generic, non-personal default. The reverse-DNS-ish form is only a codesign
+# identifier string; override per-org with --identifier-prefix / the env var.
+DEFAULT_IDENTIFIER_PREFIX = "local.tcc-venv"
+CFLAGS = ["-Wall", "-Wextra", "-O2"]
 
 
 # --------------------------------------------------------------------------- #
@@ -38,6 +41,33 @@ SOURCE = Path(__file__).with_name("trampoline.c")
 def _die(msg: str, code: int = 1) -> NoReturn:
     print(f"tcc-venv: {msg}", file=sys.stderr)
     raise SystemExit(code)
+
+
+def _tool(name: str) -> str:
+    """Resolve a build tool, preferring the system copy in /usr/bin over $PATH
+    so a shadowed `codesign`/`cc` can't slip into a security-sensitive launcher."""
+    system = Path("/usr/bin") / name
+    if system.exists():
+        return str(system)
+    found = shutil.which(name)
+    if found:
+        return found
+    _die(f"required tool not found: {name}")
+
+
+def _cc() -> str:
+    """C compiler. Prefer $CC, then the absolute /usr/bin/cc — the system driver
+    shim that auto-injects the active SDK sysroot (the bare `xcrun --find cc`
+    toolchain clang does not, so it can't find <errno.h>). Fall back to $PATH."""
+    env_cc = os.environ.get("CC")
+    if env_cc:
+        return env_cc
+    if Path("/usr/bin/cc").exists():
+        return "/usr/bin/cc"
+    found = shutil.which("cc")
+    if not found:
+        _die("no C compiler (cc) found — install Xcode command line tools.")
+    return found
 
 
 def _venv_dir(arg: str | None) -> Path:
@@ -67,12 +97,20 @@ def _project_name(venv: Path) -> str:
     return slug
 
 
-def _identity(venv: Path) -> tuple[str, str]:
+def _identifier_prefix(args: argparse.Namespace) -> str:
+    return (
+        getattr(args, "identifier_prefix", None)
+        or os.environ.get("TCC_VENV_IDENTIFIER_PREFIX")
+        or DEFAULT_IDENTIFIER_PREFIX
+    )
+
+
+def _identity(venv: Path, prefix: str) -> tuple[str, str]:
     """(filename, identifier). Identifier includes a hash of the venv realpath so
     two projects with the same friendly name never share a TCC grant (Codex #6)."""
     name = _project_name(venv)
     digest = hashlib.sha256(str(venv).encode()).hexdigest()[:8]
-    return f"python-tcc-{name}", f"ai.mxs.tcc.{name}.{digest}"
+    return f"python-tcc-{name}", f"{prefix}.{name}.{digest}"
 
 
 def _arch() -> str:
@@ -80,31 +118,89 @@ def _arch() -> str:
 
 
 def _build_unsigned() -> Path:
-    """Compile the trampoline once per arch; cache the unsigned binary."""
-    out = CACHE_DIR / "unsigned" / _arch() / "python-tcc"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    if out.exists() and out.stat().st_mtime >= SOURCE.stat().st_mtime:
+    """Compile the trampoline; cache the unsigned binary keyed by the source
+    content + compiler flags (Codex #3 — mtime is unreliable across reinstalls)."""
+    key = hashlib.sha256(
+        SOURCE.read_bytes() + b"\0" + " ".join(CFLAGS).encode()
+    ).hexdigest()[:16]
+    out = CACHE_DIR / "unsigned" / _arch() / f"{key}.bin"
+    if out.exists():
         return out
-    cc = shutil.which("cc")
-    if not cc:
-        _die("no C compiler (cc) found — install Xcode command line tools.")
+    out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".tmp")
-    subprocess.run(
-        [cc, "-Wall", "-Wextra", "-O2", str(SOURCE), "-o", str(tmp)],
-        check=True,
-    )
-    tmp.replace(out)
+    subprocess.run([_cc(), *CFLAGS, str(SOURCE), "-o", str(tmp)], check=True)
+    os.replace(tmp, out)
     return out
 
 
-def _cdhash(path: Path) -> str:
+def _codesign_show(path: Path) -> dict[str, str]:
     res = subprocess.run(
-        ["codesign", "-dvvv", str(path)], capture_output=True, text=True
+        [_tool("codesign"), "-dvvv", str(path)], capture_output=True, text=True
     )
+    info: dict[str, str] = {}
     for line in (res.stderr + res.stdout).splitlines():
-        if line.startswith("CDHash="):
-            return line.split("=", 1)[1].strip()
-    return "?"
+        if "=" in line:
+            key, _, value = line.partition("=")
+            info.setdefault(key.strip(), value.strip())
+    return info
+
+
+def _cdhash(path: Path) -> str:
+    return _codesign_show(path).get("CDHash", "?")
+
+
+def _verify(path: Path, identifier: str) -> bool:
+    """A signed binary is good only if it passes codesign --verify, carries the
+    expected identifier, and has a real cdhash (Codex #5)."""
+    res = subprocess.run(
+        [_tool("codesign"), "--verify", "--strict", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        return False
+    info = _codesign_show(path)
+    return info.get("Identifier") == identifier and info.get("CDHash", "?") not in (
+        "",
+        "?",
+    )
+
+
+def _atomic_install(
+    installed: Path, source: Path, identifier: str, *, sign: bool
+) -> bool:
+    """Stage `source` into a temp file beside `installed`, optionally codesign it,
+    verify it, then atomically swap it in (Codex #4 — never expose an unsigned or
+    half-written binary). Returns False if the result fails verification."""
+    tmp = installed.with_name(f".{installed.name}.tmp")
+    try:
+        shutil.copyfile(source, tmp)
+        tmp.chmod(0o755)
+        if sign:
+            # Capture codesign's chatter (e.g. "replacing existing signature",
+            # which arm64 always emits — the linker ad-hoc signs at link time);
+            # surface it only if signing actually fails.
+            res = subprocess.run(
+                [
+                    _tool("codesign"),
+                    "--force",
+                    "--sign",
+                    "-",
+                    "--identifier",
+                    identifier,
+                    str(tmp),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode != 0:
+                _die(f"codesign failed for {installed}:\n{res.stderr.strip()}")
+        if not _verify(tmp, identifier):
+            return False
+        os.replace(tmp, installed)
+        return True
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _symlink(link: Path, target: str) -> None:
@@ -119,6 +215,7 @@ def _symlink(link: Path, target: str) -> None:
 
 
 def cmd_wrap(args: argparse.Namespace) -> None:
+    prefix = _identifier_prefix(args)
     for raw in args.venv or [None]:
         venv = _venv_dir(raw)
         bindir = venv / "bin"
@@ -129,26 +226,28 @@ def cmd_wrap(args: argparse.Namespace) -> None:
             print(f"{shim} -> python   (non-macOS passthrough)")
             continue
 
-        filename, identifier = _identity(venv)
+        filename, identifier = _identity(venv, prefix)
         installed = bindir / filename
         signed_cache = CACHE_DIR / "signed" / identifier
 
         # Reuse the exact signed bytes if we have them (Codex #7: copy-back beats
         # re-signing, so the cdhash — and thus the TCC grant — is identical by
-        # construction across uv sync / codesign version drift).
+        # construction across uv sync / codesign version drift). The restore is
+        # verified, not trusted, so a corrupt/mismatched cache falls through to a
+        # fresh build (Codex #5).
+        restored = False
         if signed_cache.exists() and not args.rebuild:
-            shutil.copyfile(signed_cache, installed)
-        else:
-            shutil.copyfile(_build_unsigned(), installed)
-            installed.chmod(0o755)
-            subprocess.run(
-                ["codesign", "--force", "--sign", "-", "--identifier", identifier,
-                 str(installed)],
-                check=True,
-            )
+            restored = _atomic_install(installed, signed_cache, identifier, sign=False)
+
+        if not restored:
+            unsigned = _build_unsigned()
+            if not _atomic_install(installed, unsigned, identifier, sign=True):
+                _die(f"codesign verification failed for {installed}")
             signed_cache.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(installed, signed_cache)
-        installed.chmod(0o755)
+            cache_tmp = signed_cache.with_suffix(".tmp")
+            shutil.copyfile(installed, cache_tmp)
+            os.replace(cache_tmp, signed_cache)
+
         _symlink(shim, filename)
 
         print(f"wrapped {venv}")
@@ -177,10 +276,19 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"  shim:   {shim} -> {target}")
     real = venv / "bin" / target
     if IS_MACOS and real.exists():
-        _, identifier = _identity(venv)
+        _, identifier = _identity(venv, _identifier_prefix(args))
         print(f"  binary: {real}")
         print(f"  cdhash: {_cdhash(real)}")
         print(f"  expect: {identifier}")
+
+
+def _add_prefix_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--identifier-prefix",
+        default=None,
+        help="codesign identifier prefix (default: $TCC_VENV_IDENTIFIER_PREFIX or "
+        f"{DEFAULT_IDENTIFIER_PREFIX!r}); identifier is <prefix>.<project>.<hash8>",
+    )
 
 
 def main() -> None:
@@ -197,10 +305,12 @@ def main() -> None:
         action="store_true",
         help="force a fresh build+sign (new cdhash — needs re-granting FDA)",
     )
+    _add_prefix_arg(p_wrap)
     p_wrap.set_defaults(func=cmd_wrap)
 
     p_status = sub.add_parser("status", help="show the wrapper installed in a venv")
     p_status.add_argument("venv", nargs="?", help="venv dir; default ./.venv")
+    _add_prefix_arg(p_status)
     p_status.set_defaults(func=cmd_status)
 
     args = parser.parse_args()
