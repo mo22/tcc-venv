@@ -9,6 +9,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Moritz Möller", email = "mm@mxs.de" }]
 keywords = ["macos", "tcc", "codesign", "uv", "venv", "full-disk-access"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
     "Environment :: MacOS X",
     "Intended Audience :: Developers",
     "Operating System :: MacOS :: MacOS X",

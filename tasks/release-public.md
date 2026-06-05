@@ -43,7 +43,9 @@ permission dialog.
 - [ ] Standard audit stack per global setup (osv-scanner, gitleaks) — light, few deps.
 
 ### b) Deploy to PyPI
-- [ ] Confirm `tcc-venv` (and `python-tcc`) names are free on PyPI; pick license (MIT?).
+- [x] Confirm the `tcc-venv` name is free on PyPI (it is, 2026-06-05). Only `tcc-venv`
+      is published; `python-tcc` is the installed binary/shim name, never a package.
+      License: MIT.
 - [ ] Trusted-publishing (PyPI OIDC) via GitHub Actions on tag, or manual `uv build` +
       `twine`/`uv publish`.
 - [ ] `pipx install tcc-venv` / `uvx tcc-venv` smoke test from the published artifact.
