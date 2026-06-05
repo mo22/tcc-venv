@@ -117,12 +117,19 @@ def _arch() -> str:
     return platform.machine() or "unknown"
 
 
-def _build_unsigned() -> Path:
-    """Compile the trampoline; cache the unsigned binary keyed by the source
-    content + compiler flags (Codex #3 — mtime is unreliable across reinstalls)."""
-    key = hashlib.sha256(
+def _source_tag() -> str:
+    """A short hash of the trampoline source + compiler flags. Two tcc-venv versions
+    with different trampoline bytes get different tags, so the per-arch unsigned and
+    per-identity signed caches both bust on a real source change (Codex #3: mtime is
+    unreliable across reinstalls)."""
+    return hashlib.sha256(
         SOURCE.read_bytes() + b"\0" + " ".join(CFLAGS).encode()
     ).hexdigest()[:16]
+
+
+def _build_unsigned() -> Path:
+    """Compile the trampoline; cache the unsigned binary keyed by the source tag."""
+    key = _source_tag()
     out = CACHE_DIR / "unsigned" / _arch() / f"{key}.bin"
     if out.exists():
         return out
@@ -216,6 +223,10 @@ def _symlink(link: Path, target: str) -> None:
 
 def cmd_wrap(args: argparse.Namespace) -> None:
     prefix = _identifier_prefix(args)
+    # Compute once so every venv in a single invocation is keyed consistently, even
+    # if the source were edited mid-run.
+    source_tag = _source_tag()
+    arch = _arch()
     for raw in args.venv or [None]:
         venv = _venv_dir(raw)
         bindir = venv / "bin"
@@ -228,7 +239,12 @@ def cmd_wrap(args: argparse.Namespace) -> None:
 
         filename, identifier = _identity(venv, prefix)
         installed = bindir / filename
-        signed_cache = CACHE_DIR / "signed" / identifier
+        # Key the signed cache by identifier + arch + source tag: re-wrap after
+        # `uv sync` restores byte-identical bytes (grant persists), but upgrading
+        # tcc-venv to a changed trampoline busts the cache → fresh build+sign → new
+        # cdhash (a one-time FDA re-grant, which a genuinely different binary requires
+        # anyway). Arch is in the key because signed bytes are arch-specific.
+        signed_cache = CACHE_DIR / "signed" / f"{identifier}.{arch}.{source_tag}"
 
         # Reuse the exact signed bytes if we have them (Codex #7: copy-back beats
         # re-signing, so the cdhash — and thus the TCC grant — is identical by
@@ -255,13 +271,20 @@ def cmd_wrap(args: argparse.Namespace) -> None:
         print(f"  shim:       {shim} -> {filename}")
         print(f"  identifier: {identifier}")
         print(f"  cdhash:     {_cdhash(installed)}")
+        print("  run your app through this stable binary (not uv/uvx), e.g.:")
+        print(f"    {installed} your_app.py")
+        print(f"    {installed} -m your_module")
+        print(
+            "  set TCC_VENV_CHDIR=1 to run from the project root (or a path to cd there)"
+        )
     if IS_MACOS:
         print(
             "\nGrant the binary Full Disk Access ONCE:\n"
             "  System Settings -> Privacy & Security -> Full Disk Access -> add the\n"
             "  python-tcc-<project> binary above. Automation/EventKit prompts appear\n"
             "  on first use. Re-running `tcc-venv wrap` after `uv sync` restores the\n"
-            "  identical identity, so the grant persists."
+            "  identical identity, so the grant persists. Upgrading tcc-venv to a new\n"
+            "  trampoline changes the cdhash — you'll re-grant once when that happens."
         )
 
 

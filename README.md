@@ -34,9 +34,15 @@ identity that you grant *once*:
 
 The launcher self-locates its venv, spawns `<venv>/bin/python` with your arguments,
 forwards signals, and propagates the exit code — staying the parent process so TCC
-attributes everything to *it*. Re-running `wrap` after `uv sync` restores the
-**identical** signed bytes from a local cache, so the cdhash — and the grant — is
-unchanged.
+attributes everything to *it*. To make that hold even when the launcher above it does
+*not* hand it a TCC identity (a GUI app, a terminal — anything that isn't launchd), it
+re-spawns a self-responsible copy of itself first (a "disclaim" bootstrap), so the
+stable signed identity owns the grant regardless of who started it. Re-running `wrap`
+after `uv sync` restores the **identical** signed bytes from a local cache, so the
+cdhash — and the grant — is unchanged.
+
+Set `TCC_VENV_CHDIR=1` to run from the project root (the venv's parent), or to a path
+to `cd` there — handy when the launcher gives an unpredictable working directory.
 
 ### What it is *not*
 
@@ -143,14 +149,17 @@ never share a grant.
 1. Compile `trampoline.c` once per architecture (cached, unsigned).
 2. Copy it to `<venv>/bin/python-tcc-<project>` and ad-hoc codesign it with a stable
    `--identifier`.
-3. Cache the **signed bytes** by identifier; on re-wrap, copy them back so the cdhash
-   is byte-identical regardless of codesign version drift.
+3. Cache the **signed bytes** by `identifier` + source tag; on re-wrap, copy them back
+   so the cdhash is byte-identical regardless of codesign version drift. (Upgrading
+   `tcc-venv` to a changed trampoline changes the tag → new cdhash → re-grant once.)
 4. Symlink `python-tcc -> python-tcc-<project>`.
 
 At runtime the trampoline resolves its own path → venv, refuses to run if a stray
-`$VIRTUAL_ENV` disagrees, `posix_spawn`s the venv's `python`, forwards signals, and
-returns the child's exit status (`128 + signo` on signal death). On non-macOS it's a
-plain `exec` of the venv python with no signing.
+`$VIRTUAL_ENV` disagrees, re-spawns a self-responsible copy of itself (disclaim
+bootstrap) so its identity owns the grant under any launcher, optionally `cd`s per
+`$TCC_VENV_CHDIR`, `posix_spawn`s the venv's `python`, forwards signals, and returns
+the child's exit status (`128 + signo` on signal death). On non-macOS it's a plain
+`exec` of the venv python with no signing.
 
 See [`AGENTS.md`](AGENTS.md) for the full design and invariants.
 

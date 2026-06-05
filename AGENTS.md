@@ -41,14 +41,37 @@ pyproject.toml    # hatchling; force-includes trampoline.c into the wheel.
 5. Symlink `<venv>/bin/python-tcc -> python-tcc-<name>` (the uniform name used in
    shebangs / process control).
 
-On re-wrap (after `uv sync` blows the binary away), the **signed bytes are copied
-back** from cache, so the cdhash — and therefore the TCC grant — is identical by
-construction, immune to codesign-version drift.
+The signed-bytes cache is keyed by `<identifier>.<source-tag>` (source-tag = hash of
+`trampoline.c` + CFLAGS). So re-wrap after `uv sync` blows the binary away copies the
+**identical bytes** back (cdhash + TCC grant unchanged, immune to codesign-version
+drift), but upgrading `tcc-venv` to a *changed* trampoline busts the cache → fresh
+build+sign → new cdhash, i.e. a **one-time FDA re-grant** (which a genuinely different
+binary requires anyway). Without the source-tag, a stale signed binary would silently
+ship after a tool upgrade.
 
 The trampoline:
 - self-locates its venv from its own executable path (`_NSGetExecutablePath` +
   `realpath`), **never** trusts `$VIRTUAL_ENV` to pick the interpreter — it only
   *refuses to run* if `$VIRTUAL_ENV` disagrees with the self-located venv.
+- **disclaim-self bootstrap (macOS):** on launch (phase A) it re-`posix_spawn`s a
+  second copy of *itself* with the private SPI `responsibility_spawnattrs_setdisclaim`
+  (the same call LLDB uses so the debuggee owns TCC prompts) + an env guard
+  `TCC_VENV_DISCLAIMED=1`. The disclaimed copy (phase B) becomes its **own** TCC
+  responsible root — so our stable signed identity owns the grant *regardless of the
+  launcher above us* (a GUI app, a terminal, launchd). Without this, a non-disclaiming
+  parent's identity (e.g. a GUI app that spawns us) would be the responsible root and
+  our identity would be moot. Degrades gracefully: if the SPI is unavailable
+  the bootstrap is skipped (= the launchd-only behavior); `TCC_VENV_NO_DISCLAIM=1`
+  opts out (for A/B attribution testing).
+  - **Why two copies, not one disclaiming spawn of python:** disclaim makes the
+    *spawned child* self-responsible. Disclaiming python directly would make
+    *python* (the churning interpreter path) the identity. So we disclaim a copy of
+    the stable trampoline, which then spawns python *without* disclaim — python
+    inherits the trampoline's stable identity by the normal copy-on-spawn rule.
+- honors `$TCC_VENV_CHDIR` to set the child's cwd: an absolute path → that dir; any
+  other truthy value (e.g. `1`) → the project root (the venv's parent), so a process
+  launched with an unpredictable cwd (a GUI app) runs from its repo; unset/`0` →
+  untouched. A failed chdir is a hard error.
 - `posix_spawn`s `<venv>/bin/python` (falls back to `python3`) and stays the live
   parent (must NOT exec into python, or the child becomes the responsible process
   and loses the grant).
@@ -71,7 +94,12 @@ the C file still compiles to a plain `execv`).
   only `--rebuild` mints a new cdhash (and forces re-granting FDA).
 - **Self-locate, never `$VIRTUAL_ENV`-redirect.** A leaked `$VIRTUAL_ENV` must never
   make this binary run another project's interpreter under this identity.
-- **Stay the parent.** Spawn + wait, don't exec, so TCC inheritance holds.
+- **Stay the parent.** Spawn + wait, don't exec, so the python child inherits our
+  responsible PID. Note: staying the parent only makes *us* the identity if *we* are
+  already self-responsible — which under a non-disclaiming launcher we are not, hence
+  the disclaim-self bootstrap. The disclaim flag belongs on the A→B spawn only; the
+  B→python spawn must be a plain spawn (disclaiming python = python becomes the
+  identity = the churning-path bug).
 
 ## Status / caveats
 
