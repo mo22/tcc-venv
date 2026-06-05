@@ -46,11 +46,12 @@ permission dialog.
 - [x] Confirm the `tcc-venv` name is free on PyPI (it is, 2026-06-05). Only `tcc-venv`
       is published; `python-tcc` is the installed binary/shim name, never a package.
       License: MIT.
-- [ ] Trusted-publishing (PyPI OIDC) via GitHub Actions on tag, or manual `uv build` +
-      `twine`/`uv publish`.
-- [ ] `pipx install tcc-venv` / `uvx tcc-venv` smoke test from the published artifact.
-- [ ] Note: wheel ships `trampoline.c`; build happens client-side at `wrap` time (needs
-      `cc`). Document the Xcode CLT requirement.
+- [x] Trusted-publishing (PyPI OIDC) via GitHub Actions on release. `.github/workflows/
+      publish.yml` + repo `pypi` environment + PyPI pending publisher. **v0.1.0 published
+      2026-06-05** (release tag v0.1.0 → workflow run 27017162063, green).
+- [x] `uvx tcc-venv` smoke test from the published artifact — installs and runs `status`.
+- [x] Wheel ships `trampoline.c`; build is client-side at `wrap` time (needs `cc`). Xcode
+      CLT requirement documented in README ("Requirements").
 
 ### c) Parameterize the branding
 - [x] Make the identifier prefix configurable (flag / env / config) instead of the
