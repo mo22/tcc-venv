@@ -115,6 +115,18 @@ cdhash determinism that *can* drift across macOS / codesign versions. It does **
 bypass TCC — the user still grants explicitly in System Settings; it only stabilizes
 the identity. Treat as unofficial; verify on the macOS versions you ship to.
 
+**Trust boundary — no command whitelist (deliberate).** The TCC grant belongs to the
+*signed binary*, not to any particular command. Whoever can launch that binary inherits
+its grant (potentially Full Disk Access): `tcc-venv run X` puts X under the identity, but
+so does invoking the binary directly in generic-exec mode (`TCC_VENV_EXEC=1
+python-tcc-<project> /bin/sh …`) or just `python-tcc -c '…'`. So a command allowlist in
+the *CLI* would be trivially bypassed; a real one would have to be baked into the signed
+trampoline, which breaks the "bytes are project-independent" invariant and busts the
+cdhash on every policy change. We don't ship one. **Treat write-access to the venv /
+ability to launch the shim as equivalent to holding the grant.** If you genuinely need to
+constrain what runs under the identity, the right primitive is a macOS
+profile/entitlement, not a string whitelist.
+
 Open release work is tracked in `tasks/release-public.md`.
 
 ## Conventions

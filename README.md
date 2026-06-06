@@ -7,6 +7,14 @@ dialog shows a recognizable per-project name instead of `python3.12`.
 > macOS only for the privacy benefit. On Linux/Windows it degrades to a no-op
 > passthrough so the same launcher name works everywhere.
 
+> **Why macOS only?** The privacy-grant-churn problem is specific to macOS TCC. The
+> nearest analogues elsewhere are *path-keyed*, not signature-keyed: Windows Defender
+> Firewall matches its allow rules by image path, and Linux AppArmor/SELinux confine by
+> path — so a moving venv-python path can drift out from under those too. But the fix
+> there is simply a **stable launcher path**, which the no-op `python-tcc` symlink
+> already gives you on every platform; there is no codesigning, disclaim bootstrap, or
+> privacy prompt involved off macOS.
+
 ## The problem
 
 macOS TCC (the privacy system behind *Full Disk Access*, *Automation*, *Calendar*,

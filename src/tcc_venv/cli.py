@@ -313,9 +313,14 @@ def cmd_status(args: argparse.Namespace) -> None:
     real = venv / "bin" / target
     if IS_MACOS and real.exists():
         _, identifier = _identity(venv, _identifier_prefix(args))
+        info = _codesign_show(real)
+        actual = info.get("Identifier", "?")
         print(f"  binary: {real}")
-        print(f"  cdhash: {_cdhash(real)}")
+        print(f"  cdhash: {info.get('CDHash', '?')}")
         print(f"  expect: {identifier}")
+        print(f"  actual: {actual}")
+        ok = _verify(real, identifier)
+        print(f"  verify: {'ok' if ok else 'MISMATCH (re-run `tcc-venv wrap`)'}")
 
 
 def _run_venv(arg: str | None) -> Path:
