@@ -23,6 +23,8 @@ src/tcc_venv/
   cli.py          # the `tcc-venv` CLI: wrap / run / status. build + codesign + cache logic.
   trampoline.c    # the signed launcher. self-locates its venv, spawns python, forwards signals.
   __init__.py
+tests/
+  test_concurrency.py  # concurrent-wrap regressions (macOS only, stdlib unittest)
 pyproject.toml    # hatchling; force-includes trampoline.c into the wheel.
 ```
 
@@ -107,6 +109,16 @@ the C file still compiles to a plain `execv`).
   the disclaim-self bootstrap. The disclaim flag belongs on the A→B spawn only; the
   B→python spawn must be a plain spawn (disclaiming python = python becomes the
   identity = the churning-path bug).
+- **Concurrent invocations are the normal case, not an edge case.** Several launchd
+  daemons share a venv and all start in the same second at boot. So: every staging
+  path goes through `_staged()` and is private to the writing process (a fixed
+  `.tmp` name plus `finally: unlink` made two runs delete each other's file and cost
+  a boot on 2026-07-31 — v0.2.2); `python-tcc` is swapped with `rename(2)`, never
+  unlink-then-create (that leaves a window where the shim does not exist and a third
+  daemon exec'ing it gets ENOENT); and an already-correct install short-circuits
+  before doing any writes at all. Note `_build_unsigned`'s staging path lives in the
+  **machine-wide** cache, so the peer racing you there is an unrelated project — a
+  same-venv test cannot see that one.
 
 ## Status / caveats
 
@@ -132,5 +144,13 @@ Open release work is tracked in `tasks/release-public.md`.
 ## Conventions
 
 - Format Python with `uvx ruff format` / `uvx ruff check --fix`.
-- No runtime deps (stdlib only). Keep it that way — this is a tiny tool.
+- No runtime deps (stdlib only). Keep it that way — this is a tiny tool. The tests
+  are stdlib `unittest` for the same reason: `python -m unittest discover -s tests`,
+  no test dependency to install.
 - The trampoline must stay warning-clean under `-Wall -Wextra`.
+- A concurrency test that has never been seen failing proves nothing. Re-check it by
+  reverting the fix under test — and revert the *staging-path* fix specifically, not
+  the retry: the retry alone masks most of the race, so a mutation that leaves it in
+  place still passes. Measured on the v0.2.2 suite: fixed tmp name + retry = 1
+  failure, fixed tmp name + `INSTALL_ATTEMPTS = 1` = 3 failures, unique tmp name +
+  `INSTALL_ATTEMPTS = 1` = green (i.e. unique staging is the load-bearing fix).

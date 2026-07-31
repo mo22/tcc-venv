@@ -20,6 +20,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import NoReturn
 
@@ -36,15 +40,47 @@ CFLAGS = ["-Wall", "-Wextra", "-O2"]
 EXEC_MODE_ENV = "TCC_VENV_EXEC"  # run an explicit command under our identity
 CHDIR_ENV = "TCC_VENV_CHDIR"  # cwd for the child (1 = project root, or a path)
 
+# Overlapping invocations are normal (several launchd daemons sharing a venv all
+# start in the same second at boot), so an install that loses a race retries.
+INSTALL_ATTEMPTS = 4
+
 
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
 
 
+class _SignFailed(Exception):
+    """codesign refused. Retryable: under concurrency it is usually transient."""
+
+
 def _die(msg: str, code: int = 1) -> NoReturn:
     print(f"tcc-venv: {msg}", file=sys.stderr)
     raise SystemExit(code)
+
+
+@contextmanager
+def _staged(dest: Path) -> Generator[Path]:
+    """Yield a private staging path beside `dest`, removed on the way out.
+
+    The name MUST be unique per process. A fixed one (plus the unlink below) made
+    two concurrent installs delete each other's half-written file; the loser died
+    either in `codesign` or on `os.replace`, and it cost a boot (2026-07-31).
+    Applies to every staging path, including the ones in the machine-wide cache,
+    where the peer racing you is an unrelated project."""
+    fd, name = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
+    os.close(fd)
+    tmp = Path(name)
+    try:
+        yield tmp
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _retry_backoff(attempt: int) -> None:
+    """Exponential, with a per-process offset so two racing peers desynchronise
+    instead of colliding again in lockstep. Worst case ≈0.7 s before we give up."""
+    time.sleep(0.05 * (2**attempt) * (1 + (os.getpid() % 16) / 16))
 
 
 def _tool(name: str) -> str:
@@ -132,21 +168,29 @@ def _source_tag() -> str:
 
 
 def _build_unsigned() -> Path:
-    """Compile the trampoline; cache the unsigned binary keyed by the source tag."""
+    """Compile the trampoline; cache the unsigned binary keyed by the source tag.
+
+    This cache is machine-wide and the key depends only on the trampoline source,
+    so the process racing you here is any other project's `tcc-venv` — not just
+    another run against your venv. Hence the private staging path."""
     key = _source_tag()
     out = CACHE_DIR / "unsigned" / _arch() / f"{key}.bin"
     if out.exists():
         return out
     out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix(".tmp")
-    subprocess.run([_cc(), *CFLAGS, str(SOURCE), "-o", str(tmp)], check=True)
-    os.replace(tmp, out)
+    with _staged(out) as tmp:
+        subprocess.run([_cc(), *CFLAGS, str(SOURCE), "-o", str(tmp)], check=True)
+        os.replace(tmp, out)
     return out
 
 
 def _codesign_show(path: Path) -> dict[str, str]:
+    # check=False: an unsigned/absent binary is a normal answer here, not an error.
     res = subprocess.run(
-        [_tool("codesign"), "-dvvv", str(path)], capture_output=True, text=True
+        [_tool("codesign"), "-dvvv", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     info: dict[str, str] = {}
     for line in (res.stderr + res.stdout).splitlines():
@@ -163,10 +207,12 @@ def _cdhash(path: Path) -> str:
 def _verify(path: Path, identifier: str) -> bool:
     """A signed binary is good only if it passes codesign --verify, carries the
     expected identifier, and has a real cdhash (Codex #5)."""
+    # check=False: a failed verify is the question being asked, not an exception.
     res = subprocess.run(
         [_tool("codesign"), "--verify", "--strict", str(path)],
         capture_output=True,
         text=True,
+        check=False,
     )
     if res.returncode != 0:
         return False
@@ -180,11 +226,13 @@ def _verify(path: Path, identifier: str) -> bool:
 def _atomic_install(
     installed: Path, source: Path, identifier: str, *, sign: bool
 ) -> bool:
-    """Stage `source` into a temp file beside `installed`, optionally codesign it,
-    verify it, then atomically swap it in (Codex #4 — never expose an unsigned or
-    half-written binary). Returns False if the result fails verification."""
-    tmp = installed.with_name(f".{installed.name}.tmp")
-    try:
+    """Stage `source` into a private temp file beside `installed`, optionally
+    codesign it, verify it, then atomically swap it in (Codex #4 — never expose an
+    unsigned or half-written binary). Returns False if the result fails
+    verification; raises _SignFailed if codesign itself refused. Both are
+    retryable by the caller, because under concurrency both are usually
+    transient."""
+    with _staged(installed) as tmp:
         shutil.copyfile(source, tmp)
         tmp.chmod(0o755)
         if sign:
@@ -203,26 +251,53 @@ def _atomic_install(
                 ],
                 capture_output=True,
                 text=True,
+                check=False,  # handled below, so the stderr can be surfaced
             )
             if res.returncode != 0:
-                _die(f"codesign failed for {installed}:\n{res.stderr.strip()}")
+                raise _SignFailed(
+                    f"codesign failed for {installed}:\n{res.stderr.strip()}"
+                )
         if not _verify(tmp, identifier):
             return False
         os.replace(tmp, installed)
         return True
-    finally:
-        tmp.unlink(missing_ok=True)
 
 
 def _symlink(link: Path, target: str) -> None:
-    if link.is_symlink() or link.exists():
-        link.unlink()
-    link.symlink_to(target)
+    """Point `link` at `target` atomically.
+
+    Never unlink-then-create: that leaves a window in which `python-tcc` does not
+    exist, and a daemon exec'ing the shim right then dies with ENOENT even though
+    every writer succeeded. rename(2) over an existing symlink is atomic and does
+    not follow the link."""
+    if link.is_symlink() and os.readlink(link) == target:
+        return
+    tmp = link.with_name(f".{link.name}.{os.getpid()}.lnk")
+    tmp.unlink(missing_ok=True)
+    tmp.symlink_to(target)
+    try:
+        os.replace(tmp, link)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 # --------------------------------------------------------------------------- #
 # commands
 # --------------------------------------------------------------------------- #
+
+
+def _install_is_current(installed: Path, signed_cache: Path, identifier: str) -> bool:
+    """True if `installed` is already byte-for-byte what we would write, and valid.
+    Cheap (the binary is ~50 KB) and lets the common case skip all filesystem
+    writes — the narrower the write window, the less there is to race over."""
+    if not installed.exists() or not signed_cache.exists():
+        return False
+    if installed.stat().st_size != signed_cache.stat().st_size:
+        return False
+    if installed.read_bytes() != signed_cache.read_bytes():
+        return False
+    return _verify(installed, identifier)
 
 
 def _ensure_installed(
@@ -237,26 +312,48 @@ def _ensure_installed(
     a changed trampoline busts the cache → fresh build+sign → new cdhash (a one-time
     re-grant, which a genuinely different binary requires anyway). Arch is in the key
     because signed bytes are arch-specific. The restore is verified, not trusted, so a
-    corrupt/mismatched cache falls through to a fresh build (Codex #5)."""
+    corrupt/mismatched cache falls through to a fresh build (Codex #5).
+
+    Concurrency-safe: already-correct installs short-circuit without writing, every
+    staging path is private to this process, and a lost race is retried."""
     bindir = venv / "bin"
     filename, identifier = _identity(venv, prefix)
     installed = bindir / filename
     signed_cache = CACHE_DIR / "signed" / f"{identifier}.{arch}.{source_tag}"
 
-    restored = False
-    if signed_cache.exists() and not rebuild:
-        restored = _atomic_install(installed, signed_cache, identifier, sign=False)
-    if not restored:
-        unsigned = _build_unsigned()
-        if not _atomic_install(installed, unsigned, identifier, sign=True):
-            _die(f"codesign verification failed for {installed}")
-        signed_cache.parent.mkdir(parents=True, exist_ok=True)
-        cache_tmp = signed_cache.with_suffix(".tmp")
-        shutil.copyfile(installed, cache_tmp)
-        os.replace(cache_tmp, signed_cache)
+    # Fast path: the overwhelmingly common case is re-running against a venv that is
+    # already correctly wrapped (every `tcc-venv run`, every boot). Doing no writes
+    # at all there means there is nothing for a concurrent peer to race with.
+    if not rebuild and _install_is_current(installed, signed_cache, identifier):
+        _symlink(bindir / "python-tcc", filename)
+        return installed, False
 
-    _symlink(bindir / "python-tcc", filename)
-    return installed, not restored
+    last_error = ""
+    for attempt in range(INSTALL_ATTEMPTS):
+        try:
+            restored = False
+            if signed_cache.exists() and not rebuild:
+                restored = _atomic_install(
+                    installed, signed_cache, identifier, sign=False
+                )
+            if not restored:
+                unsigned = _build_unsigned()
+                if not _atomic_install(installed, unsigned, identifier, sign=True):
+                    raise _SignFailed(f"codesign verification failed for {installed}")
+                signed_cache.parent.mkdir(parents=True, exist_ok=True)
+                with _staged(signed_cache) as cache_tmp:
+                    shutil.copyfile(installed, cache_tmp)
+                    os.replace(cache_tmp, signed_cache)
+
+            _symlink(bindir / "python-tcc", filename)
+            return installed, not restored
+        except (OSError, _SignFailed) as e:
+            last_error = str(e)
+            if attempt < INSTALL_ATTEMPTS - 1:
+                _retry_backoff(attempt)
+    _die(
+        f"install failed for {installed} after {INSTALL_ATTEMPTS} attempts: {last_error}"
+    )
 
 
 def cmd_wrap(args: argparse.Namespace) -> None:

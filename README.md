@@ -186,6 +186,12 @@ never share a grant.
    `tcc-venv` to a changed trampoline changes the tag → new cdhash → re-grant once.)
 4. Symlink `python-tcc -> python-tcc-<project>`.
 
+Steps 1–3 are safe to run concurrently: several launchd daemons sharing a venv all
+start in the same second at boot, so each invocation stages into a private temp file,
+swaps the shim with an atomic rename, and skips the work entirely when the installed
+binary is already correct. (Before 0.2.2 they shared a fixed staging filename and
+deleted each other's, so the loser died — see the changelog.)
+
 At runtime the trampoline resolves its own path → venv, refuses to run if a stray
 `$VIRTUAL_ENV` disagrees, re-spawns a self-responsible copy of itself (disclaim
 bootstrap) so its identity owns the grant under any launcher, optionally `cd`s per
@@ -194,6 +200,24 @@ the child's exit status (`128 + signo` on signal death). On non-macOS it's a pla
 `exec` of the venv python with no signing.
 
 See [`AGENTS.md`](AGENTS.md) for the full design and invariants.
+
+## Changelog
+
+### 0.2.2
+
+Fixes a race between concurrent invocations. Every staging path was a fixed filename
+removed in a `finally:`, so two overlapping runs deleted each other's half-written
+file and the loser exited with a traceback — which cost a real boot when two launchd
+daemons sharing a venv started in the same second. Three sites were affected: the
+per-venv install, the **machine-wide** compile cache (where the racing peer is an
+unrelated project, not another run against your venv), and the signed-bytes cache.
+Also: `python-tcc` is now swapped with an atomic rename instead of unlink-then-create,
+which previously left a window in which the shim did not exist at all, and an
+already-correct install now short-circuits without writing anything.
+
+**No re-grant needed.** This release does not touch `trampoline.c`, so the source tag,
+the signed-bytes cache key and the cdhash are all unchanged — existing Full Disk
+Access / Automation grants keep working.
 
 ## License
 
