@@ -91,6 +91,12 @@ The trampoline:
   (`POSIX_SPAWN_SETSIGMASK | SETSIGDEF`) so it actually receives them.
 - forwards SIGINT/TERM/HUP/QUIT/USR1/USR2 (directed at the wrapper) to the child's
   process group, propagates exit status (`128 + signo` on signal death).
+- **watches its own parent** with kqueue `EVFILT_PROC`/`NOTE_EXIT` (plus a `getppid()`
+  re-check to close the register-after-death race) and, when the parent dies, tears
+  down its child tree and exits — the safety net for a SIGKILLed parent, which can
+  forward nothing. The teardown is layer-aware (see the invariant below): the leaf
+  layer escalates SIGTERM → ~3 s → SIGKILL on the payload group; the bootstrap layer
+  only SIGTERMs and exits.
 
 On non-macOS the installer just symlinks `python-tcc -> python` (pure passthrough;
 the C file still compiles to a plain `execv`).
@@ -109,6 +115,16 @@ the C file still compiles to a plain `execv`).
   the disclaim-self bootstrap. The disclaim flag belongs on the A→B spawn only; the
   B→python spawn must be a plain spawn (disclaiming python = python becomes the
   identity = the churning-path bug).
+- **Parent-death teardown is layer-aware; never SIGKILL a trampoline child.** Both
+  disclaim layers run the same binary and each leads its own process group, so each
+  watches its own parent. When the bootstrap layer's parent dies it must only SIGTERM
+  its child and *exit* — SIGKILLing the inner trampoline would kill it before it could
+  tear down the `uv run`/python group one layer deeper, re-orphaning the payload (the
+  2026-09-24 incident). Exiting lets the inner layer detect the death via its own
+  parent watch and escalate to SIGKILL on the payload group it actually parents. Only
+  the leaf layer (child = python / the `tcc-venv run` command) SIGKILLs its child
+  group. Regression: `tests/test_parent_death.py` — verify by reverting `trampoline.c`
+  to before the watch (it re-orphans the tree; the fix leaves nothing behind).
 - **Concurrent invocations are the normal case, not an edge case.** Several launchd
   daemons share a venv and all start in the same second at boot. So: every staging
   path goes through `_staged()` and is private to the writing process (a fixed

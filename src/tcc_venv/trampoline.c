@@ -35,6 +35,8 @@
 #ifdef __APPLE__
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
+#include <sys/event.h>
+#include <time.h>
 #endif
 
 extern char **environ;
@@ -58,6 +60,13 @@ typedef int (*setdisclaim_fn)(posix_spawnattr_t *, bool);
 #define DISCLAIM_OPT_OUT "TCC_VENV_NO_DISCLAIM"
 /* sentinel distinct from any real 0..255 exit code. */
 #define SUPERVISE_SPAWN_FAILED (-1)
+
+/* Exit code used when we tear down because our PARENT died (not the child). The
+ * launcher above us is already gone, so nobody reads this — it is only a marker. */
+#define PARENT_DEATH_EXIT (128 + SIGKILL) /* 137 */
+/* Grace between SIGTERM and SIGKILL when killing the payload group on parent death. */
+#define TEARDOWN_GRACE_TICKS 60          /* * 50 ms = ~3 s */
+#define TEARDOWN_TICK_NS (50 * 1000 * 1000)
 #endif
 
 static const int FORWARDED_SIGNALS[] = {
@@ -186,15 +195,51 @@ static int apply_chdir(const char *venv) {
 }
 
 #ifdef __APPLE__
+/* Our parent died (for any reason, including SIGKILL, where the forwarded-signal
+ * path can never run). Tear down our child tree and exit so we don't linger
+ * reparented to launchd with the payload still running. Never returns.
+ *
+ * `child_is_trampoline` distinguishes the two layers of the disclaim bootstrap,
+ * which each lead their OWN process group:
+ *   - false (leaf layer, child = python / the `tcc-venv run` command): the child
+ *     group is the real payload, so escalate SIGTERM -> grace -> SIGKILL on it to
+ *     guarantee it dies even if it ignores SIGTERM.
+ *   - true (bootstrap layer, child = a second copy of THIS trampoline): only
+ *     SIGTERM the child and exit. A SIGKILL here would kill the inner trampoline
+ *     before it can tear down ITS own child group, orphaning the payload one layer
+ *     deeper (the exact failure this task fixes). By exiting we let the inner
+ *     trampoline detect our death via its own parent watch and escalate on its own
+ *     group. */
+static void parent_died_teardown(pid_t child, int child_is_trampoline) {
+    if (child > 0) {
+        kill(-child, SIGTERM);
+        if (!child_is_trampoline) {
+            struct timespec tick = {0, TEARDOWN_TICK_NS};
+            for (int i = 0; i < TEARDOWN_GRACE_TICKS; i++) {
+                if (waitpid(child, NULL, WNOHANG) == child) {
+                    break; /* direct child gone; still SIGKILL the group for stragglers */
+                }
+                nanosleep(&tick, NULL);
+            }
+            kill(-child, SIGKILL);
+        }
+    }
+    _exit(PARENT_DEATH_EXIT);
+}
+
 /* Spawn `path` (argv `child_argv`) as our own-process-group child, then block +
  * forward signals across the spawn, wait, and return the child's exit code
  * (128 + signo on signal death), or SUPERVISE_SPAWN_FAILED if the spawn failed.
  *   - disclaim_fn != NULL: mark the child to disclaim our TCC responsibility, so it
  *     becomes its own responsible root (used for the A->B re-spawn).
  *   - manage_terminal:     hand the child the controlling terminal's foreground
- *     (used for the final B->python spawn so an interactive REPL / Ctrl-C works). */
+ *     (used for the final B->python spawn so an interactive REPL / Ctrl-C works).
+ *   - child_is_trampoline: the child is a second copy of this trampoline (the A->B
+ *     disclaim re-spawn), not the payload — controls the parent-death teardown (see
+ *     parent_died_teardown). */
 static int spawn_and_supervise(const char *path, char **child_argv,
-                               setdisclaim_fn disclaim_fn, int manage_terminal) {
+                               setdisclaim_fn disclaim_fn, int manage_terminal,
+                               int child_is_trampoline) {
     /* Don't let us be stopped if we write to the tty while the child owns the
      * terminal foreground (set below). */
     signal(SIGTTOU, SIG_IGN);
@@ -255,6 +300,75 @@ static int spawn_and_supervise(const char *path, char **child_argv,
 
     install_signal_handlers();
     sigprocmask(SIG_SETMASK, &prev, NULL);
+
+    /* Watch for child exit AND parent death via kqueue, so if our parent dies we
+     * tear down the whole child tree instead of lingering reparented to launchd.
+     * This closes the gap the forwarded-signal path cannot: a SIGKILLed parent
+     * forwards nothing. Signals are still forwarded by the handlers installed above;
+     * a forwarded signal merely interrupts kevent(), which we resume. */
+    pid_t parent = getppid();
+    int kq = kqueue();
+    int watching = 0;
+    if (kq != -1) {
+        struct kevent changes[2];
+        EV_SET(&changes[0], (uintptr_t)pid, EVFILT_PROC,
+               EV_ADD | EV_ONESHOT | EV_RECEIPT, NOTE_EXIT, 0, NULL);
+        EV_SET(&changes[1], (uintptr_t)parent, EVFILT_PROC,
+               EV_ADD | EV_ONESHOT | EV_RECEIPT, NOTE_EXIT, 0, NULL);
+        struct kevent receipts[2];
+        int nr = kevent(kq, changes, 2, receipts, 2, NULL);
+        int child_err = -1, parent_err = -1;
+        for (int i = 0; i < nr; i++) {
+            if ((pid_t)receipts[i].ident == pid) {
+                child_err = (int)receipts[i].data;
+            } else if ((pid_t)receipts[i].ident == parent) {
+                parent_err = (int)receipts[i].data;
+            }
+        }
+        if (parent_err == ESRCH) {
+            /* Parent already gone before we could register the watch. */
+            close(kq);
+            parent_died_teardown(pid, child_is_trampoline); /* no return */
+        }
+        if (child_err == 0) {
+            watching = 1; /* a nonzero parent_err is fine: the ppid recheck covers it */
+        } else {
+            /* Child already a zombie (ESRCH) or unwatchable: fall back to a blocking
+             * waitpid, which returns immediately for a zombie. */
+            close(kq);
+            kq = -1;
+        }
+    }
+
+    /* Close the race where the parent died after getppid() but before the EV_ADD. */
+    if (watching && getppid() != parent) {
+        close(kq);
+        parent_died_teardown(pid, child_is_trampoline); /* no return */
+    }
+
+    if (watching) {
+        for (;;) {
+            struct kevent ev;
+            int n = kevent(kq, NULL, 0, &ev, 1, NULL);
+            if (n == -1) {
+                if (errno == EINTR) {
+                    continue; /* a forwarded signal interrupted us; resume waiting */
+                }
+                break; /* unexpected — fall back to the blocking waitpid below */
+            }
+            if (n == 0) {
+                continue;
+            }
+            if (ev.filter == EVFILT_PROC && (pid_t)ev.ident == parent) {
+                close(kq);
+                parent_died_teardown(pid, child_is_trampoline); /* no return */
+            }
+            if (ev.filter == EVFILT_PROC && (pid_t)ev.ident == pid) {
+                break; /* child exited — reap it below */
+            }
+        }
+        close(kq);
+    }
 
     int status;
     for (;;) {
@@ -319,7 +433,8 @@ int main(int argc, char *argv[]) {
                  * the env, do NOT spawn (the child would loop) — fall through. */
                 if (setenv(DISCLAIM_GUARD, "1", 1) == 0) {
                     int rc = spawn_and_supervise(self, self_argv, disclaim_fn,
-                                                 /*manage_terminal=*/1);
+                                                 /*manage_terminal=*/1,
+                                                 /*child_is_trampoline=*/1);
                     free(self_argv);
                     if (rc != SUPERVISE_SPAWN_FAILED) {
                         free(self);
@@ -376,7 +491,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "python-tcc: execv %s failed: %s\n", argv[1], strerror(errno));
         return 127;
 #else
-        int rc = spawn_and_supervise(argv[1], &argv[1], NULL, /*manage_terminal=*/1);
+        int rc = spawn_and_supervise(argv[1], &argv[1], NULL, /*manage_terminal=*/1,
+                                     /*child_is_trampoline=*/0);
         return rc == SUPERVISE_SPAWN_FAILED ? 127 : rc;
 #endif
     }
@@ -458,7 +574,7 @@ int main(int argc, char *argv[]) {
      * python WITHOUT disclaim so it inherits our stable identity, and hand it the
      * controlling terminal so an interactive REPL works. */
     int rc = spawn_and_supervise(python, child_argv, /*disclaim_fn=*/NULL,
-                                 /*manage_terminal=*/1);
+                                 /*manage_terminal=*/1, /*child_is_trampoline=*/0);
     free(child_argv);
     free(python);
     if (rc == SUPERVISE_SPAWN_FAILED) {
