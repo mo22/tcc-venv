@@ -196,12 +196,33 @@ At runtime the trampoline resolves its own path → venv, refuses to run if a st
 `$VIRTUAL_ENV` disagrees, re-spawns a self-responsible copy of itself (disclaim
 bootstrap) so its identity owns the grant under any launcher, optionally `cd`s per
 `$TCC_VENV_CHDIR`, `posix_spawn`s the venv's `python`, forwards signals, and returns
-the child's exit status (`128 + signo` on signal death). On non-macOS it's a plain
+the child's exit status (`128 + signo` on signal death). It also watches its own
+parent and, if the parent dies (including a SIGKILL), tears down its whole child tree
+and exits instead of lingering orphaned under launchd. On non-macOS it's a plain
 `exec` of the venv python with no signing.
 
 See [`AGENTS.md`](AGENTS.md) for the full design and invariants.
 
 ## Changelog
+
+### 0.2.3
+
+The trampoline now tears down its whole child process tree when its **parent** dies —
+including a `SIGKILL`, where the forwarded-signal path can never run. It watches the
+parent pid with kqueue (`EVFILT_PROC`/`NOTE_EXIT`) and, on parent death, kills the
+payload's process group (`SIGTERM` → short grace → `SIGKILL`) before exiting. This
+fixes a leak under launchd: launchd `SIGKILL`s only a job's main pid after its exit
+timeout, so the trampoline used to survive reparented to PID 1 and keep the whole
+`uv run` / python subtree alive (it held a daemon's instance lock for days and grew to
+a 103 GB footprint). The teardown is layer-aware across the two disclaim-bootstrap
+layers so neither the inner trampoline nor the payload group is orphaned. Signal
+forwarding, exit-code propagation and interactive terminal handling are unchanged.
+
+**Re-grant needed once.** This release changes `trampoline.c`, so the source tag, the
+signed-bytes cache key and the cdhash change. After you upgrade and re-`wrap` (or run
+`tcc-venv run`, which wraps on demand), each wrapped venv gets a freshly signed binary
+with a new identity — re-grant it Full Disk Access / Automation once in System
+Settings, as you would for any genuinely new binary.
 
 ### 0.2.2
 
