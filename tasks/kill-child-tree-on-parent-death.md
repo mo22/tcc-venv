@@ -1,10 +1,19 @@
 # Task: kill the child process tree when the trampoline's parent dies
 
-Status: **implemented, verified — awaiting release** (code done 2026-09-24, dispatched
-from agent-setup session dc961425). The trampoline change is committed; the FDA
-re-grant it forces means **release/tag/publish and upgrading the installed `uvx
-tcc-venv` still need Moritz's go-ahead** (Constraints below), so those steps are NOT
-done.
+Status: **DONE — released as v0.2.3** (2026-09-24, dispatched from agent-setup session
+dc961425; release authorized by Moritz same day). Fix committed (`122fa6d`), version
+bump (`af8c180`), GitHub release `v0.2.3` → PyPI publish workflow green (run
+36046552309), `tcc-venv 0.2.3` live on PyPI, persistent `uv tool` upgraded to 0.2.3.
+
+**Fleet rollout / FDA re-grant (the one-time cost):** publishing 0.2.3 arms the
+re-grant — every consumer that resolves `tcc-venv` unpinned or `>=` will move to the
+new trampoline on its **next restart**, get a new cdhash, and need Full Disk Access /
+Automation re-granted once in System Settings. Running daemons are unaffected until
+they restart. The uvx cache was NOT force-cleaned, so the fleet rolls over naturally
+rather than all at once. At the time of release the live consumers were: fileindex-mcp
+(unpinned → will move), webshell (`>=0.2.0` → will move), mac-mcp (`==0.2.1` → pinned,
+stays), plus whatsapp-mcp / winmgr venvs (re-grant on next `wrap`). Optional final
+sign-off: re-run the launchd probe below against the released build.
 
 ## Goal
 
@@ -165,11 +174,12 @@ ignores SIGTERM. All on a scratch venv wrapped with the locally-built trampoline
    `trampoline.c` for `git show HEAD:` and re-running. Trampoline stays warning-clean
    under `-Wall -Wextra -O2`.
 
-### Not done (needs Moritz) — the release
+### Release (done 2026-09-24, authorized by Moritz)
 
 Changing `trampoline.c` busts `_source_tag()` ⇒ new cdhash ⇒ **one-time FDA re-grant
-for every wrapped venv** once the new version is installed. Do not tag/publish or
-`uv tool upgrade tcc-venv` (used unpinned via `uvx` by fileindex-mcp's `control.yaml`
-/ `run-mcp.py`) without confirmation. Release notes must name the re-grant. The
-launchd probe in §Reproduction should be re-run once against the *released* build as
-the final sign-off (this session verified the local build only).
+for every wrapped venv** once the new version is installed — named in the v0.2.3
+release notes and README changelog. Shipped: version bump 0.2.2 → 0.2.3, GitHub
+release `v0.2.3` (triggered `.github/workflows/publish.yml`, run 36046552309 green),
+`tcc-venv 0.2.3` on PyPI (wheel + sdist), persistent `uv tool` upgraded to 0.2.3. The
+launchd probe in §Reproduction was verified against a locally-built trampoline, not
+yet re-run against the released PyPI build — that remains the optional final sign-off.
